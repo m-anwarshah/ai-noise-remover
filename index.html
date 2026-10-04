@@ -14,64 +14,59 @@
             align-items: center;
             min-height: 100vh;
             margin: 0;
-            padding: 15px;
-            box-sizing: border-box;
         }
         .container {
             background-color: #1e1e24;
-            padding: 25px;
+            padding: 30px;
             border-radius: 12px;
             box-shadow: 0 8px 24px rgba(0,0,0,0.3);
             text-align: center;
             max-width: 450px;
             width: 100%;
+            box-sizing: border-box;
         }
-        h1 { margin-top: 0; margin-bottom: 15px; font-size: 24px; color: #4fc3f7; }
-        p { font-size: 14px; color: #aaa; margin-bottom: 25px; }
+        h1 { margin-bottom: 20px; font-size: 24px; color: #4fc3f7; }
         .btn {
             background-color: #00e676;
             color: #121214;
             border: none;
-            padding: 14px 24px;
+            padding: 12px 24px;
             font-size: 16px;
             font-weight: bold;
-            border-radius: 8px;
+            border-radius: 6px;
             cursor: pointer;
             transition: background 0.2s;
-            margin: 8px 0;
+            margin: 10px 0;
             width: 100%;
-            -webkit-tap-highlight-color: transparent;
         }
         .btn:hover { background-color: #00b359; }
-        .btn:disabled { background-color: #333; color: #777; cursor: not-allowed; }
-        #processBtn { background-color: #00b0ff; color: #fff; }
-        #processBtn:hover { background-color: #0091ea; }
-        #processBtn:disabled { background-color: #333; color: #777; }
-        .status { margin: 20px 0; font-style: italic; font-size: 14px; color: #ffca28; }
-        .audio-section { margin-top: 25px; padding-top: 20px; border-top: 1px solid #333; text-align: left; }
-        label { display: block; margin-bottom: 8px; font-weight: 600; color: #00e676; font-size: 14px; }
-        audio { width: 100%; margin-bottom: 15px; }
+        .btn:disabled { background-color: #555; color: #888; cursor: not-allowed; }
+        .status { margin: 15px 0; font-style: italic; color: #ffb300; min-height: 20px; }
+        .audio-section { margin-top: 25px; padding-top: 20px; border-top: 1px solid #333; }
+        label { display: block; margin-bottom: 8px; font-weight: 600; color: #00e676; text-align: left; }
+        audio { width: 100%; margin-bottom: 10px; }
     </style>
-    <!-- Loading RNNoise WASM wrapper library from open-source CDN -->
-    <script src="https://cdn.jsdelivr.net/npm/rnnoise-wasm@0.1.1/dist/rnnoise.js"></script>
+    
+    <!-- FIX: Loading Jitsi's sync version which contains the compiled WASM inlined as a Base64 string -->
+    <script src="https://jsdelivr.net"></script>
 </head>
 <body>
 
 <div class="container">
     <h1>AI Noise Remover</h1>
-    <p>Upload a noisy audio file to clean it entirely offline inside your browser.</p>
+    <p>Upload a noisy voice recording to clean it entirely offline inside your browser.</p>
     
     <input type="file" id="audioInput" accept="audio/*" style="display: none;">
     <button class="btn" id="uploadBtn">Select Audio File</button>
     <button class="btn" id="processBtn" disabled>Clean Audio with AI</button>
     
-    <div class="status" id="statusText">Ready. Choose an audio file to begin.</div>
+    <div class="status" id="statusText">Initializing AI Engine...</div>
 
     <div class="audio-section" id="audioOutputs" style="display: none;">
         <label>Original Noisy Audio</label>
         <audio id="originalAudio" controls></audio>
         
-        <label style="margin-top: 15px; color: #00b0ff;">AI Enhanced Clean Audio</label>
+        <label style="margin-top: 15px;">AI Enhanced Clean Audio</label>
         <audio id="cleanedAudio" controls></audio>
     </div>
 </div>
@@ -88,10 +83,28 @@
     let audioBuffer = null;
     let rnnoiseModule = null;
 
-    // Trigger file selection window
+    // Initialize the module immediately on page load
+    async function initAI() {
+        try {
+            statusText.innerText = "Loading AI Module (Inlined WASM)...";
+            // The Jitsi sync package initializes via standard Emscripten execution
+            if (typeof NoiseSuppressorWorklet === 'undefined' && window.CmarRnnoise) {
+                 rnnoiseModule = await window.CmarRnnoise();
+            } else {
+                 rnnoiseModule = await createRnnoiseModule(); 
+            }
+            statusText.innerText = "AI Engine ready. Select an audio file.";
+        } catch(e) {
+            console.error(e);
+            statusText.innerText = "Error configuring AI engine template pipeline.";
+        }
+    }
+    
+    // Run initialization
+    window.addEventListener('DOMContentLoaded', initAI);
+
     uploadBtn.addEventListener('click', () => audioInput.click());
 
-    // Handle selected audio file
     audioInput.addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if (!file) return;
@@ -101,10 +114,8 @@
         audioOutputs.style.display = 'block';
 
         try {
-            // Read audio file into standard Web Audio Context
             const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             const arrayBuffer = await file.arrayBuffer();
-            // Decode the file data into standard PCM float arrays
             audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
             
             statusText.innerText = "Audio loaded successfully. Ready to process.";
@@ -115,81 +126,73 @@
         }
     });
 
-    // Run the AI processing pipeline when user clicks the button
     processBtn.addEventListener('click', async () => {
         if (!audioBuffer) return;
         processBtn.disabled = true;
-        statusText.innerText = "Initializing AI Model (WASM)...";
-
-        // Initialize RNNoise WASM module if it hasn't loaded yet
-        if (!rnnoiseModule) {
-            try {
-                rnnoiseModule = await Rnnoise.load();
-            } catch (e) {
-                statusText.innerText = "Failed to load AI model module.";
-                processBtn.disabled = false;
-                return;
-            }
-        }
-
-        statusText.innerText = "Processing audio frame-by-frame... Please wait.";
-
-        // RNNoise operates natively at a 48kHz sampling rate, in mono audio channels
+        
         const sampleRate = audioBuffer.sampleRate;
-        // Grab channel 0 (left/mono channel) data
         const inputData = audioBuffer.getChannelData(0); 
         const totalSamples = inputData.length;
         
-        // RNNoise handles processing in strict 10ms frame fragments (exactly 480 samples)
         const frameSize = 480; 
         const outputData = new Float32Array(totalSamples);
 
-        // Frame processing loop
+        statusText.innerText = "Creating AI denoise state context...";
+        // Create an instance state room for processing
+        const denoiseState = rnnoiseModule.createDenoiseState();
+
+        statusText.innerText = "Processing audio frames...";
+        
         let offset = 0;
         
-        // Set a slight timeout loop to prevent mobile browser UI freezing
+        // Asynchronous chunk loop to keep the UI fluid on mobile processors
         function processChunk() {
-            const startChunk = Date.now();
-            // Process in chunks of frames to keep UI responsive
-            while (offset < totalSamples) {
+            const end = Math.min(offset + 19200, totalSamples); // run in bits of 4 frames
+            
+            while (offset < end) {
                 const inputFrame = new Float32Array(frameSize);
-                
-                // Extract the 480-sample frame slice from the audio track
                 for (let i = 0; i < frameSize; i++) {
                     if (offset + i < totalSamples) {
-                        inputFrame[i] = inputData[offset + i];
+                        inputFrame[i] = inputData[offset + i] * 32768; // Scale float to 16-bit PCM integer range
                     }
                 }
 
-                // Execute the AI model frame inference locally
-                const cleanFrame = rnnoiseModule.processFrame(inputFrame);
+                // Allocate memory in WASM heap stack arrays
+                const wasmInputBuffer = rnnoiseModule._malloc(frameSize * 4);
+                rnnoiseModule.HEAPF32.set(inputFrame, wasmInputBuffer / 4);
+
+                // Run structural AI filtering vector calculations
+                rnnoiseModule.processFrame(denoiseState, wasmInputBuffer, wasmInputBuffer);
+
+                // Pull data back down out of the WASM heap segment allocation layout
+                const cleanFrame = rnnoiseModule.HEAPF32.subarray(wasmInputBuffer / 4, wasmInputBuffer / 4 + frameSize);
                 
-                // Map the cleaned sample array directly back into the output track
                 for (let i = 0; i < frameSize; i++) {
                     if (offset + i < totalSamples) {
-                        outputData[offset + i] = cleanFrame[i];
+                        outputData[offset + i] = cleanFrame[i] / 32768; // Normalize sound spectrum parameters back to standard float range
                     }
                 }
-                
+
+                rnnoiseModule._free(wasmInputBuffer);
                 offset += frameSize;
-                
-                // Give breathing room to the browser rendering thread every 30ms
-                if (Date.now() - startChunk > 30) {
-                    const progress = Math.min(100, Math.round((offset / totalSamples) * 100));
-                    statusText.innerText = `Processing: ${progress}%...`;
-                    setTimeout(processChunk, 0);
-                    return;
-                }
             }
-            
-            completeProcessing();
+
+            if (offset < totalSamples) {
+                const progress = Math.round((offset / totalSamples) * 100);
+                statusText.innerText = `Processing: ${progress}%...`;
+                setTimeout(processChunk, 0);
+            } else {
+                finalizeAudio();
+            }
         }
 
-        function completeProcessing() {
+        function finalizeAudio() {
             statusText.innerText = "AI Processing complete! Creating playback file...";
+            
+            // Clean memory context configurations
+            rnnoiseModule.destroyDenoiseState(denoiseState);
 
-            // Wrap the raw PCM array data back into a valid browser audio Blob object
-            const cleanBuffer = new (window.AudioContext || window.webkitAudioContext)().createBuffer(1, totalSamples, sampleRate);
+            const cleanBuffer = new AudioContext().createBuffer(1, totalSamples, sampleRate);
             cleanBuffer.getChannelData(0).set(outputData);
             
             const wavBlob = bufferToWav(cleanBuffer);
@@ -199,10 +202,10 @@
             processBtn.disabled = false;
         }
 
+        // Start processing cycle
         processChunk();
     });
 
-    // Helper Utility: Encapsulates raw Float32 audio tracks into a standard WAV container
     function bufferToWav(buffer) {
         let numOfChan = buffer.numberOfChannels,
             length = buffer.length * numOfChan * 2 + 44,
@@ -212,24 +215,22 @@
             offset = 0,
             pos = 0;
 
-        // Write WAV Header markers
         setUint32(0x46464952); // "RIFF"
-        setUint32(length - 8); // file length - 8
+        setUint32(length - 8); 
         setUint32(0x45564157); // "WAVE"
         setUint32(0x20746d66); // "fmt " chunk
-        setUint32(16);         // chunk length
-        setUint16(1);          // sample format (raw linear PCM data)
+        setUint32(16);         
+        setUint16(1);          
         setUint16(numOfChan);
         setUint32(buffer.sampleRate);
-        setUint32(buffer.sampleRate * 2 * numOfChan); // byte rate
-        setUint16(numOfChan * 2);                     // block align
-        setUint16(16);                                // bits per sample
-        setUint32(0x61746164);                        // "data" chunk
-        setUint32(length - pos - 4);                  // chunk length
+        setUint32(buffer.sampleRate * 2 * numOfChan); 
+        setUint16(numOfChan * 2);                     
+        setUint16(16);                                
+        setUint32(0x61746164);                        
+        setUint32(length - pos - 4);                  
 
         for(i = 0; i < buffer.numberOfChannels; i++) channels.push(buffer.getChannelData(i));
 
-        // Interleave audio channel frames and map sample ranges into 16-bit integer PCM numbers
         while(pos < length) {
             for(i = 0; i < numOfChan; i++) {
                 sample = Math.max(-1, Math.min(1, channels[i][offset]));
@@ -249,3 +250,4 @@
 
 </body>
 </html>
+
