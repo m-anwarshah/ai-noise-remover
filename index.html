@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>In-Browser AI Audio Noise Remover</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #121214;
+            color: #e1e1e6;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 15px;
+            box-sizing: border-box;
+        }
+        .container {
+            background-color: #1e1e24;
+            padding: 25px;
+            border-radius: 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+            text-align: center;
+            max-width: 450px;
+            width: 100%;
+        }
+        h1 { margin-top: 0; margin-bottom: 15px; font-size: 24px; color: #4fc3f7; }
+        p { font-size: 14px; color: #aaa; margin-bottom: 25px; }
+        .btn {
+            background-color: #00e676;
+            color: #121214;
+            border: none;
+            padding: 14px 24px;
+            font-size: 16px;
+            font-weight: bold;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.2s;
+            margin: 8px 0;
+            width: 100%;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .btn:hover { background-color: #00b359; }
+        .btn:disabled { background-color: #333; color: #777; cursor: not-allowed; }
+        #processBtn { background-color: #00b0ff; color: #fff; }
+        #processBtn:hover { background-color: #0091ea; }
+        #processBtn:disabled { background-color: #333; color: #777; }
+        .status { margin: 20px 0; font-style: italic; font-size: 14px; color: #ffca28; }
+        .audio-section { margin-top: 25px; padding-top: 20px; border-top: 1px solid #333; text-align: left; }
+        label { display: block; margin-bottom: 8px; font-weight: 600; color: #00e676; font-size: 14px; }
+        audio { width: 100%; margin-bottom: 15px; }
+    </style>
+    <!-- Loading RNNoise WASM wrapper library from open-source CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/rnnoise-wasm@0.1.1/dist/rnnoise.js"></script>
+</head>
+<body>
+
+<div class="container">
+    <h1>AI Noise Remover</h1>
+    <p>Upload a noisy audio file to clean it entirely offline inside your browser.</p>
+    
+    <input type="file" id="audioInput" accept="audio/*" style="display: none;">
+    <button class="btn" id="uploadBtn">Select Audio File</button>
+    <button class="btn" id="processBtn" disabled>Clean Audio with AI</button>
+    
+    <div class="status" id="statusText">Ready. Choose an audio file to begin.</div>
+
+    <div class="audio-section" id="audioOutputs" style="display: none;">
+        <label>Original Noisy Audio</label>
+        <audio id="originalAudio" controls></audio>
+        
+        <label style="margin-top: 15px; color: #00b0ff;">AI Enhanced Clean Audio</label>
+        <audio id="cleanedAudio" controls></audio>
+    </div>
+</div>
+
+<script>
+    const uploadBtn = document.getElementById('uploadBtn');
+    const audioInput = document.getElementById('audioInput');
+    const processBtn = document.getElementById('processBtn');
+    const statusText = document.getElementById('statusText');
+    const audioOutputs = document.getElementById('audioOutputs');
+    const originalAudio = document.getElementById('originalAudio');
+    const cleanedAudio = document.getElementById('cleanedAudio');
+
+    let audioBuffer = null;
+    let rnnoiseModule = null;
+
+    // Trigger file selection window
+    uploadBtn.addEventListener('click', () => audioInput.click());
+
+    // Handle selected audio file
+    audioInput.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        statusText.innerText = "Loading audio file...";
+        originalAudio.src = URL.createObjectURL(file);
+        audioOutputs.style.display = 'block';
+
+        try {
+            // Read audio file into standard Web Audio Context
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const arrayBuffer = await file.arrayBuffer();
+            // Decode the file data into standard PCM float arrays
+            audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+            
+            statusText.innerText = "Audio loaded successfully. Ready to process.";
+            processBtn.disabled = false;
+        } catch (err) {
+            statusText.innerText = "Error parsing file. Try a standard .wav or .mp3.";
+            console.error(err);
+        }
+    });
+
+    // Run the AI processing pipeline when user clicks the button
+    processBtn.addEventListener('click', async () => {
+        if (!audioBuffer) return;
+        processBtn.disabled = true;
+        statusText.innerText = "Initializing AI Model (WASM)...";
+
+        // Initialize RNNoise WASM module if it hasn't loaded yet
+        if (!rnnoiseModule) {
+            try {
+                rnnoiseModule = await Rnnoise.load();
+            } catch (e) {
+                statusText.innerText = "Failed to load AI model module.";
+                processBtn.disabled = false;
+                return;
+            }
+        }
+
+        statusText.innerText = "Processing audio frame-by-frame... Please wait.";
+
+        // RNNoise operates natively at a 48kHz sampling rate, in mono audio channels
+        const sampleRate = audioBuffer.sampleRate;
+        // Grab channel 0 (left/mono channel) data
+        const inputData = audioBuffer.getChannelData(0); 
+        const totalSamples = inputData.length;
+        
+        // RNNoise handles processing in strict 10ms frame fragments (exactly 480 samples)
+        const frameSize = 480; 
+        const outputData = new Float32Array(totalSamples);
+
+        // Frame processing loop
+        let offset = 0;
+        
+        // Set a slight timeout loop to prevent mobile browser UI freezing
+        function processChunk() {
+            const startChunk = Date.now();
+            // Process in chunks of frames to keep UI responsive
+            while (offset < totalSamples) {
+                const inputFrame = new Float32Array(frameSize);
+                
+                // Extract the 480-sample frame slice from the audio track
+                for (let i = 0; i < frameSize; i++) {
+                    if (offset + i < totalSamples) {
+                        inputFrame[i] = inputData[offset + i];
+                    }
+                }
+
+                // Execute the AI model frame inference locally
+                const cleanFrame = rnnoiseModule.processFrame(inputFrame);
+                
+                // Map the cleaned sample array directly back into the output track
+                for (let i = 0; i < frameSize; i++) {
+                    if (offset + i < totalSamples) {
+                        outputData[offset + i] = cleanFrame[i];
+                    }
+                }
+                
+                offset += frameSize;
+                
+                // Give breathing room to the browser rendering thread every 30ms
+                if (Date.now() - startChunk > 30) {
+                    const progress = Math.min(100, Math.round((offset / totalSamples) * 100));
+                    statusText.innerText = `Processing: ${progress}%...`;
+                    setTimeout(processChunk, 0);
+                    return;
+                }
+            }
+            
+            completeProcessing();
+        }
+
+        function completeProcessing() {
+            statusText.innerText = "AI Processing complete! Creating playback file...";
+
+            // Wrap the raw PCM array data back into a valid browser audio Blob object
+            const cleanBuffer = new (window.AudioContext || window.webkitAudioContext)().createBuffer(1, totalSamples, sampleRate);
+            cleanBuffer.getChannelData(0).set(outputData);
+            
+            const wavBlob = bufferToWav(cleanBuffer);
+            cleanedAudio.src = URL.createObjectURL(wavBlob);
+            
+            statusText.innerText = "Done! Your clean audio track is ready.";
+            processBtn.disabled = false;
+        }
+
+        processChunk();
+    });
+
+    // Helper Utility: Encapsulates raw Float32 audio tracks into a standard WAV container
+    function bufferToWav(buffer) {
+        let numOfChan = buffer.numberOfChannels,
+            length = buffer.length * numOfChan * 2 + 44,
+            bufferArr = new ArrayBuffer(length),
+            view = new DataView(bufferArr),
+            channels = [], i, sample,
+            offset = 0,
+            pos = 0;
+
+        // Write WAV Header markers
+        setUint32(0x46464952); // "RIFF"
+        setUint32(length - 8); // file length - 8
+        setUint32(0x45564157); // "WAVE"
+        setUint32(0x20746d66); // "fmt " chunk
+        setUint32(16);         // chunk length
+        setUint16(1);          // sample format (raw linear PCM data)
+        setUint16(numOfChan);
+        setUint32(buffer.sampleRate);
+        setUint32(buffer.sampleRate * 2 * numOfChan); // byte rate
+        setUint16(numOfChan * 2);                     // block align
+        setUint16(16);                                // bits per sample
+        setUint32(0x61746164);                        // "data" chunk
+        setUint32(length - pos - 4);                  // chunk length
+
+        for(i = 0; i < buffer.numberOfChannels; i++) channels.push(buffer.getChannelData(i));
+
+        // Interleave audio channel frames and map sample ranges into 16-bit integer PCM numbers
+        while(pos < length) {
+            for(i = 0; i < numOfChan; i++) {
+                sample = Math.max(-1, Math.min(1, channels[i][offset]));
+                sample = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+                view.setInt16(pos, sample, true);
+                pos += 2;
+            }
+            offset++;
+        }
+
+        return new Blob([bufferArr], { type: 'audio/wav' });
+
+        function setUint16(data) { view.setUint16(pos, data, true); pos += 2; }
+        function setUint32(data) { view.setUint32(pos, data, true); pos += 4; }
+    }
+</script>
+
+</body>
+</html>
